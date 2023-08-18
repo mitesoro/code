@@ -1,13 +1,13 @@
-package tag
+package nacos
 
 import (
 	"errors"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/resolver"
-	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,10 +17,16 @@ const (
 	ctxValue      = "tag"
 )
 
-var NoMatchConErr = errors.New("no match found conn")
+var (
+	r  = rand.New(rand.NewSource(time.Now().UnixNano()))
+	mu sync.Mutex
 
-// newTagBuilder creates a new tag balancer builder.
-func newTagBuilder() {
+	NoMatchConErr = errors.New("no match found conn")
+)
+
+// NewBuilder creates a new weight balancer builder.
+func newVersionBuilder() {
+	// balancer.Builder
 	builder := base.NewBalancerBuilder(Name, &rrPickerBuilder{}, base.Config{HealthCheck: true})
 	balancer.Register(builder)
 	return
@@ -29,11 +35,12 @@ func newTagBuilder() {
 type rrPickerBuilder struct {
 }
 
-func (r *rrPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
+func (rp *rrPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 	if len(info.ReadySCs) == 0 {
 		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
 	}
 	var scs = make(map[string][]balancer.SubConn, len(info.ReadySCs))
+
 	for conn, addr := range info.ReadySCs {
 		tag := productionTag
 		if nodeTag := GetNodeTag(addr.Address); nodeTag != "" {
@@ -44,39 +51,38 @@ func (r *rrPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 	if len(scs) == 0 {
 		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
 	}
+	mu.Lock()
+	next := r.Intn(len(scs))
+	mu.Unlock()
+
 	return &rrPicker{
-		node: scs,
+		subConns: scs,
+		next:     uint32(next),
 	}
 }
 
 type rrPicker struct {
-	node map[string][]balancer.SubConn
-	mu   sync.Mutex
+	subConns map[string][]balancer.SubConn
+	next     uint32
 }
 
 // Pick 选择合适的子链接发送请求
 func (p *rrPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
-	p.mu.Lock()
-	t := time.Now().UnixNano() / 1e6
-	defer p.mu.Unlock()
-
-	var subConns []balancer.SubConn
+	tag := info.Ctx.Value("tag").(string)
 	nodeTag := productionTag
-	if tag := info.Ctx.Value(ctxValue).(string); tag != "" && len(p.node[tag]) > 0 { // 有标签
+	if tag != "" && len(p.subConns[tag]) > 0 { // 有标签
 		nodeTag = tag
 	}
-	for _, conn := range p.node[nodeTag] {
-		subConns = append(subConns, conn)
-	}
+	subConns := p.subConns[nodeTag]
 	if len(subConns) == 0 {
 		return balancer.PickResult{}, NoMatchConErr
 	}
 
-	index := rand.Intn(len(subConns))
-	sc := subConns[index]
-	return balancer.PickResult{SubConn: sc, Done: func(data balancer.DoneInfo) {
-		log.Println("test=", info.FullMethodName, "end=", data.Err, "time=", time.Now().UnixNano()/1e6-t, "sc=", sc, "data=", data)
-	}}, nil
+	subConnsLen := uint32(len(subConns))
+	nextIndex := atomic.AddUint32(&p.next, 1)
+	sc := subConns[nextIndex%subConnsLen]
+
+	return balancer.PickResult{SubConn: sc}, nil
 }
 
 func GetNodeTag(attr resolver.Address) string {
